@@ -4,8 +4,8 @@ import requests
 from datetime import datetime
 
 # ============================================================
-# BTC WHALE MONITOR
-# Monitoramento educativo de grandes movimentações de Bitcoin
+# BTC WHALE MONITOR V2
+# Monitoramento educativo de grandes movimentações BTC
 # NÃO executa compras ou vendas.
 # ============================================================
 
@@ -15,8 +15,7 @@ CHECK_SECONDS = int(os.getenv("CHECK_SECONDS", "10"))
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-MEMPOOL_API = "https://mempool.space/api/mempool/recent"
-PRICE_API = "https://mempool.space/api/v1/prices"
+BASE_URL = "https://mempool.space/api"
 
 seen = set()
 
@@ -25,7 +24,7 @@ def get_json(url):
     response = requests.get(
         url,
         timeout=20,
-        headers={"User-Agent": "BTC-Whale-Monitor"}
+        headers={"User-Agent": "BTC-Whale-Monitor-V2"}
     )
     response.raise_for_status()
     return response.json()
@@ -33,17 +32,23 @@ def get_json(url):
 
 def get_btc_price():
     try:
-        data = get_json(PRICE_API)
+        data = get_json(
+            "https://mempool.space/api/v1/prices"
+        )
         return float(data["USD"])
     except Exception:
         return None
 
 
 def send_telegram(message):
+
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{TELEGRAM_TOKEN}/sendMessage"
+    )
 
     data = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -51,108 +56,165 @@ def send_telegram(message):
     }
 
     try:
-        requests.post(url, data=data, timeout=20)
+        requests.post(
+            url,
+            data=data,
+            timeout=20
+        )
     except Exception as error:
-        print("Erro no Telegram:", error)
+        print("Erro Telegram:", error)
 
 
-def process_transaction(tx, btc_price):
-    txid = tx.get("txid")
-
-    if not txid:
-        return
-
-    if txid in seen:
-        return
-
-    seen.add(txid)
-
-    # Valor da transação em satoshis
-    value_sats = tx.get("value", 0)
-
-    btc = value_sats / 100_000_000
-
-    if btc < MIN_BTC:
-        return
-
-    usd = None
-
-    if btc_price:
-        usd = btc * btc_price
-
-    now = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-
-    if usd:
-        usd_text = f"${usd:,.0f}"
-    else:
-        usd_text = "N/D"
-
-    message = f"""
-🐋 GRANDE MOVIMENTAÇÃO BTC
-
-🕐 Horário:
-{now}
-
-₿ Quantidade:
-{btc:,.2f} BTC
-
-💵 Valor aproximado:
-{usd_text}
-
-🔗 Transação:
-https://mempool.space/tx/{txid}
-
-⚠️ IMPORTANTE:
-Uma grande transferência não significa necessariamente compra ou venda. Pode ser transferência entre carteiras, custódia, exchange ou outras operações.
-
-Este bot é somente para monitoramento.
-"""
-
-    print(message)
-
-    send_telegram(message)
+def btc_from_sats(sats):
+    return sats / 100_000_000
 
 
-def cleanup_seen():
-    global seen
+def analyze_transaction(txid, btc_price):
 
-    # Mantém a memória do programa limitada
-    if len(seen) > 10000:
-        seen = set(list(seen)[-5000:])
+    try:
+
+        tx = get_json(
+            f"{BASE_URL}/tx/{txid}"
+        )
+
+        vin = tx.get("vin", [])
+        vout = tx.get("vout", [])
+
+        input_value = sum(
+            item.get("prevout", {}).get("value", 0)
+            for item in vin
+        )
+
+        output_value = sum(
+            item.get("value", 0)
+            for item in vout
+        )
+
+        input_btc = btc_from_sats(input_value)
+        output_btc = btc_from_sats(output_value)
+
+        # Maior saída individual
+        outputs = [
+            btc_from_sats(item.get("value", 0))
+            for item in vout
+        ]
+
+        largest_output = (
+            max(outputs)
+            if outputs
+            else 0
+        )
+
+        # Número de entradas e saídas
+        input_count = len(vin)
+        output_count = len(vout)
+
+        # Classificação estrutural.
+        # Isto NÃO determina intenção de compra ou venda.
+        if input_count > output_count * 2:
+            classification = "CONSOLIDACAO DE UTXOs"
+
+        elif output_count > input_count * 2:
+            classification = "DISTRIBUICAO PARA VARIAS SAIDAS"
+
+        else:
+            classification = "GRANDE TRANSFERENCIA"
+
+        usd = (
+            output_btc * btc_price
+            if btc_price
+            else None
+        )
+
+        if usd:
+            usd_text = f"${usd:,.0f}"
+        else:
+            usd_text = "N/D"
+
+        confirmed = tx.get("status", {}).get(
+            "confirmed",
+            False
+        )
+
+        status = (
+            "CONFIRMADA"
+            if confirmed
+            else "PENDENTE"
+        )
+
+        now = datetime.now().strftime(
+            "%d/%m/%Y %H:%M:%S"
+        )
+
+        message = (
+            "🐋 GRANDE MOVIMENTAÇÃO BTC\n\n"
+            f"🕐 {now}\n\n"
+            f"₿ Valor movimentado: "
+            f"{output_btc:,.2f} BTC\n"
+            f"💵 Valor aproximado: {usd_text}\n\n"
+            f"📥 Entradas: {input_count}\n"
+            f"📤 Saídas: {output_count}\n"
+            f"💰 Maior saída: "
+            f"{largest_output:,.2f} BTC\n\n"
+            f"🔎 Classificação estrutural:\n"
+            f"{classification}\n\n"
+            f"⛓️ Status: {status}\n\n"
+            f"🔗 https://mempool.space/tx/{txid}\n\n"
+            "⚠️ Uma transferência grande não prova "
+            "compra ou venda. A classificação acima "
+            "descreve somente a estrutura da transação."
+        )
+
+        print("\n" + "=" * 65)
+        print(message)
+        print("=" * 65)
+
+        send_telegram(message)
+
+    except Exception as error:
+
+        print(
+            "Erro analisando transação",
+            txid,
+            ":",
+            error
+        )
 
 
 def main():
 
-    print("=" * 60)
-    print("🐋 BTC WHALE MONITOR")
-    print("=" * 60)
+    print("=" * 65)
+    print("🐋 BTC WHALE MONITOR V2")
+    print("=" * 65)
 
-    print(f"Alerta mínimo: {MIN_BTC} BTC")
-    print(f"Intervalo: {CHECK_SECONDS} segundos")
-    print("Modo: MONITORAMENTO")
-    print("")
+    print(
+        f"Alerta mínimo: {MIN_BTC} BTC"
+    )
+
+    print(
+        f"Intervalo: {CHECK_SECONDS} segundos"
+    )
+
+    print(
+        "Modo: MONITORAMENTO"
+    )
 
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-        print("✅ Telegram configurado")
+        print("Telegram: CONFIGURADO")
     else:
-        print("ℹ️ Telegram ainda não configurado")
+        print("Telegram: NÃO CONFIGURADO")
 
-    print("")
-    print("Iniciando monitoramento...")
-    print("=" * 60)
+    print("=" * 65)
 
     while True:
 
         try:
 
-            transactions = get_json(MEMPOOL_API)
+            recent = get_json(
+                f"{BASE_URL}/mempool/recent"
+            )
 
             btc_price = get_btc_price()
-
-            for tx in transactions:
-                process_transaction(tx, btc_price)
-
-            cleanup_seen()
 
             price_text = (
                 f"${btc_price:,.2f}"
@@ -161,23 +223,49 @@ def main():
             )
 
             print(
-                datetime.now().strftime("%H:%M:%S"),
+                datetime.now().strftime(
+                    "%H:%M:%S"
+                ),
                 "| BTC:",
                 price_text,
-                "| Transações analisadas:",
-                len(transactions)
+                "| Transações:",
+                len(recent)
             )
 
-        except KeyboardInterrupt:
+            for tx in recent:
 
-            print("\nMonitor encerrado.")
-            break
+                txid = tx.get("txid")
+
+                if not txid:
+                    continue
+
+                if txid in seen:
+                    continue
+
+                seen.add(txid)
+
+                btc = btc_from_sats(
+                    tx.get("value", 0)
+                )
+
+                if btc >= MIN_BTC:
+
+                    analyze_transaction(
+                        txid,
+                        btc_price
+                    )
+
+            # Evita crescimento infinito da memória
+            if len(seen) > 5000:
+                seen.clear()
 
         except Exception as error:
 
             print(
-                datetime.now().strftime("%H:%M:%S"),
-                "| Erro temporário:",
+                datetime.now().strftime(
+                    "%H:%M:%S"
+                ),
+                "| Erro:",
                 error
             )
 
